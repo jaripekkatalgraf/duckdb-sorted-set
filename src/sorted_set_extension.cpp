@@ -5,14 +5,17 @@
 
 #include "duckdb.hpp"
 #include "duckdb/common/types.hpp"
-#include "duckdb/common/types/vector.hpp"      // ← ListVector lives here
+#include "duckdb/common/types/vector.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+
+#include <algorithm>
 
 namespace duckdb {
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helpers: read/write DuckDB list values
+// Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 static std::vector<int32_t> read_int_list(const Value &v) {
@@ -36,485 +39,538 @@ static Value write_int_list(const std::vector<int32_t> &v) {
     return write_int_list(v.data(), (int32_t)v.size());
 }
 
+using BinarySetOp = int32_t(*)(const int32_t*,int32_t,const int32_t*,int32_t,int32_t*);
+using BinaryPred  = bool(*)(const int32_t*,int32_t,const int32_t*,int32_t);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Macros for binary functions
-// ─────────────────────────────────────────────────────────────────────────────
-
-using BinarySetOp = int32_t(*)(
-    const int32_t*, int32_t,
-    const int32_t*, int32_t,
-    int32_t*);
-
-using BinaryPred = bool(*)(const int32_t*, int32_t, const int32_t*, int32_t);
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Simple but reliable binary operations (REVERTED)
-// ─────────────────────────────────────────────────────────────────────────────
-
-static void ExecuteBinarySetOp(
-    DataChunk &args, ExpressionState &, Vector &result,
-    BinarySetOp op_func)
-{
+static void ExecuteBinarySetOp(DataChunk &args, ExpressionState &, Vector &result, BinarySetOp op) {
     idx_t count = args.size();
     result.SetVectorType(VectorType::FLAT_VECTOR);
-
     for (idx_t i = 0; i < count; ++i) {
-        if (args.data[0].GetValue(i).IsNull() || 
-            args.data[1].GetValue(i).IsNull()) {
-            FlatVector::SetNull(result, i, true);
-            continue;
+        if (args.data[0].GetValue(i).IsNull() || args.data[1].GetValue(i).IsNull()) {
+            FlatVector::SetNull(result, i, true); continue;
         }
-
         auto a = read_int_list(args.data[0].GetValue(i));
         auto b = read_int_list(args.data[1].GetValue(i));
-
         std::vector<int32_t> out(a.size() + b.size());
-        int32_t n = op_func(a.data(), (int32_t)a.size(),
-                            b.data(), (int32_t)b.size(),
-                            out.data());
-
+        int32_t n = op(a.data(),(int32_t)a.size(),b.data(),(int32_t)b.size(),out.data());
         out.resize(n);
         result.SetValue(i, write_int_list(out));
     }
 }
 
-static void ExecuteBinaryPredicate(
-    DataChunk &args, ExpressionState &, Vector &result,
-    BinaryPred pred_func)
-{
+static void ExecuteBinaryPredicate(DataChunk &args, ExpressionState &, Vector &result, BinaryPred pred) {
     idx_t count = args.size();
     result.SetVectorType(VectorType::FLAT_VECTOR);
-
     for (idx_t i = 0; i < count; ++i) {
-        if (args.data[0].GetValue(i).IsNull() || 
-            args.data[1].GetValue(i).IsNull()) {
-            FlatVector::SetNull(result, i, true);
-            continue;
+        if (args.data[0].GetValue(i).IsNull() || args.data[1].GetValue(i).IsNull()) {
+            FlatVector::SetNull(result, i, true); continue;
         }
-
         auto a = read_int_list(args.data[0].GetValue(i));
         auto b = read_int_list(args.data[1].GetValue(i));
-
-        bool res = pred_func(a.data(), (int32_t)a.size(),
-                             b.data(), (int32_t)b.size());
-
-        FlatVector::GetData<bool>(result)[i] = res;
+        FlatVector::GetData<bool>(result)[i] = pred(a.data(),(int32_t)a.size(),b.data(),(int32_t)b.size());
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Function implementations (unchanged except ctor)
+// Scalar functions
 // ─────────────────────────────────────────────────────────────────────────────
 
-static void sorted_set_ctor(
-    DataChunk &args, ExpressionState &, Vector &result)
-{
+static void sorted_set_ctor(DataChunk &args, ExpressionState &, Vector &result) {
     idx_t count = args.size();
     result.SetVectorType(VectorType::FLAT_VECTOR);
     for (idx_t i = 0; i < count; ++i) {
         auto v = args.data[0].GetValue(i);
-        if (v.IsNull()) {
-            FlatVector::SetNull(result, i, true);
-            continue;
-        }
+        if (v.IsNull()) { FlatVector::SetNull(result, i, true); continue; }
         auto data = read_int_list(v);
         if (!data.empty()) {
-            int32_t new_n = sorted_set::normalise(data.data(), (int32_t)data.size(), data.data());
+            int32_t new_n = sorted_set::normalise(data.data(),(int32_t)data.size(),data.data());
             data.resize(new_n);
         }
         result.SetValue(i, write_int_list(data));
     }
 }
 
-// ... [all your other function implementations stay exactly the same] ...
-
-//
-// set_is_valid(arr INTEGER[]) → BOOLEAN
-// Returns true if the array is already sorted and unique (a valid sorted set).
-//
-static void set_is_valid(
-    DataChunk &args, ExpressionState &, Vector &result)
-{
+static void set_is_valid(DataChunk &args, ExpressionState &, Vector &result) {
     idx_t count = args.size();
     result.SetVectorType(VectorType::FLAT_VECTOR);
     for (idx_t i = 0; i < count; ++i) {
         auto v = args.data[0].GetValue(i);
         if (v.IsNull()) { FlatVector::SetNull(result, i, true); continue; }
         auto data = read_int_list(v);
-        result.SetValue(i, Value::BOOLEAN(
-            sorted_set::is_sorted_unique(data.data(), (int32_t)data.size())));
+        result.SetValue(i, Value::BOOLEAN(sorted_set::is_sorted_unique(data.data(),(int32_t)data.size())));
     }
 }
 
-//
-// set_contains(set INTEGER[], element INTEGER) → BOOLEAN
-// Binary search. O(log n).
-//
-static void set_contains(
-    DataChunk &args, ExpressionState &, Vector &result)
-{
+static void set_contains(DataChunk &args, ExpressionState &, Vector &result) {
     idx_t count = args.size();
     result.SetVectorType(VectorType::FLAT_VECTOR);
     for (idx_t i = 0; i < count; ++i) {
-        auto sv = args.data[0].GetValue(i);
-        auto ev = args.data[1].GetValue(i);
-        if (sv.IsNull() || ev.IsNull()) {
-            FlatVector::SetNull(result, i, true); continue;
-        }
+        auto sv = args.data[0].GetValue(i); auto ev = args.data[1].GetValue(i);
+        if (sv.IsNull() || ev.IsNull()) { FlatVector::SetNull(result, i, true); continue; }
         auto data = read_int_list(sv);
-        int32_t elem = ev.GetValue<int32_t>();
-        result.SetValue(i, Value::BOOLEAN(
-            sorted_set::contains(data.data(), (int32_t)data.size(), elem)));
+        result.SetValue(i, Value::BOOLEAN(sorted_set::contains(data.data(),(int32_t)data.size(),ev.GetValue<int32_t>())));
     }
 }
 
-//
-// set_intersect_size(a INTEGER[], b INTEGER[]) → INTEGER
-// Size of the intersection without materialising it. O(n+m).
-// Useful in HAVING clauses: HAVING set_intersect_size(px, $s) = cardinality($s)
-//
-static void set_intersect_size(
-    DataChunk &args, ExpressionState &, Vector &result)
-{
+static void set_intersect_size(DataChunk &args, ExpressionState &, Vector &result) {
     idx_t count = args.size();
     result.SetVectorType(VectorType::FLAT_VECTOR);
     for (idx_t i = 0; i < count; ++i) {
-        auto av = args.data[0].GetValue(i);
-        auto bv = args.data[1].GetValue(i);
-        if (av.IsNull() || bv.IsNull()) {
-            FlatVector::SetNull(result, i, true); continue;
-        }
-        auto a = read_int_list(av);
-        auto b = read_int_list(bv);
-        result.SetValue(i, Value::INTEGER(
-            sorted_set::intersect_size(
-                a.data(), (int32_t)a.size(),
-                b.data(), (int32_t)b.size())));
+        auto av = args.data[0].GetValue(i); auto bv = args.data[1].GetValue(i);
+        if (av.IsNull() || bv.IsNull()) { FlatVector::SetNull(result, i, true); continue; }
+        auto a = read_int_list(av); auto b = read_int_list(bv);
+        result.SetValue(i, Value::INTEGER(sorted_set::intersect_size(a.data(),(int32_t)a.size(),b.data(),(int32_t)b.size())));
     }
 }
 
-//
-// set_size(set INTEGER[]) → INTEGER
-// Alias for cardinality() / array_length() — consistent naming.
-//
-static void set_size(
-    DataChunk &args, ExpressionState &, Vector &result)
-{
-    idx_t count = args.size();
-    result.SetVectorType(VectorType::FLAT_VECTOR);
+static void set_size(DataChunk &args, ExpressionState &, Vector &result) {
+    idx_t count = args.size(); result.SetVectorType(VectorType::FLAT_VECTOR);
+    for (idx_t i = 0; i < count; ++i) {
+        auto v = args.data[0].GetValue(i);
+        if (v.IsNull()) { FlatVector::SetNull(result, i, true); continue; }
+        result.SetValue(i, Value::INTEGER((int32_t)read_int_list(v).size()));
+    }
+}
+
+static void set_min(DataChunk &args, ExpressionState &, Vector &result) {
+    idx_t count = args.size(); result.SetVectorType(VectorType::FLAT_VECTOR);
     for (idx_t i = 0; i < count; ++i) {
         auto v = args.data[0].GetValue(i);
         if (v.IsNull()) { FlatVector::SetNull(result, i, true); continue; }
         auto data = read_int_list(v);
-        result.SetValue(i, Value::INTEGER((int32_t)data.size()));
+        if (data.empty()) { FlatVector::SetNull(result, i, true); continue; }
+        result.SetValue(i, Value::INTEGER(*std::min_element(data.begin(),data.end())));
     }
 }
 
-static void set_min(
-    DataChunk &args, ExpressionState &, Vector &result)
-{
-    idx_t count = args.size();
-    result.SetVectorType(VectorType::FLAT_VECTOR);
+static void set_max(DataChunk &args, ExpressionState &, Vector &result) {
+    idx_t count = args.size(); result.SetVectorType(VectorType::FLAT_VECTOR);
     for (idx_t i = 0; i < count; ++i) {
         auto v = args.data[0].GetValue(i);
-        if (v.IsNull()) { 
-            FlatVector::SetNull(result, i, true); 
-            continue; 
-        }
+        if (v.IsNull()) { FlatVector::SetNull(result, i, true); continue; }
         auto data = read_int_list(v);
-        if (data.empty()) { 
-            FlatVector::SetNull(result, i, true); 
-            continue; 
-        }
-        auto min_it = std::min_element(data.begin(), data.end());
-        result.SetValue(i, Value::INTEGER(*min_it));
+        if (data.empty()) { FlatVector::SetNull(result, i, true); continue; }
+        result.SetValue(i, Value::INTEGER(*std::max_element(data.begin(),data.end())));
     }
 }
 
-static void set_max(
-    DataChunk &args, ExpressionState &, Vector &result)
-{
-    idx_t count = args.size();
-    result.SetVectorType(VectorType::FLAT_VECTOR);
+static void set_rank(DataChunk &args, ExpressionState &, Vector &result) {
+    idx_t count = args.size(); result.SetVectorType(VectorType::FLAT_VECTOR);
     for (idx_t i = 0; i < count; ++i) {
-        auto v = args.data[0].GetValue(i);
-        if (v.IsNull()) { 
-            FlatVector::SetNull(result, i, true); 
-            continue; 
-        }
-        auto data = read_int_list(v);
-        if (data.empty()) { 
-            FlatVector::SetNull(result, i, true); 
-            continue; 
-        }
-        auto max_it = std::max_element(data.begin(), data.end());
-        result.SetValue(i, Value::INTEGER(*max_it));
+        auto sv = args.data[0].GetValue(i); auto ev = args.data[1].GetValue(i);
+        if (sv.IsNull() || ev.IsNull()) { FlatVector::SetNull(result, i, true); continue; }
+        auto data = read_int_list(sv); int32_t elem = ev.GetValue<int32_t>();
+        auto it = std::lower_bound(data.begin(),data.end(),elem);
+        result.SetValue(i, Value::INTEGER((it==data.end()||*it!=elem)?-1:(int32_t)(it-data.begin())));
     }
 }
 
-//
-// set_rank(set INTEGER[], element INTEGER) → INTEGER
-// 0-based rank of element in set (its position). -1 if not present. O(log n).
-//
-static void set_rank(
-    DataChunk &args, ExpressionState &, Vector &result)
-{
-    idx_t count = args.size();
-    result.SetVectorType(VectorType::FLAT_VECTOR);
+static void set_at(DataChunk &args, ExpressionState &, Vector &result) {
+    idx_t count = args.size(); result.SetVectorType(VectorType::FLAT_VECTOR);
     for (idx_t i = 0; i < count; ++i) {
-        auto sv = args.data[0].GetValue(i);
-        auto ev = args.data[1].GetValue(i);
-        if (sv.IsNull() || ev.IsNull()) {
-            FlatVector::SetNull(result, i, true); continue;
-        }
-        auto data = read_int_list(sv);
-        int32_t elem = ev.GetValue<int32_t>();
-        auto it = std::lower_bound(data.begin(), data.end(), elem);
-        if (it == data.end() || *it != elem)
-            result.SetValue(i, Value::INTEGER(-1));
-        else
-            result.SetValue(i, Value::INTEGER((int32_t)(it - data.begin())));
+        auto sv = args.data[0].GetValue(i); auto rv = args.data[1].GetValue(i);
+        if (sv.IsNull() || rv.IsNull()) { FlatVector::SetNull(result, i, true); continue; }
+        auto data = read_int_list(sv); int32_t rank = rv.GetValue<int32_t>();
+        if (rank < 0 || rank >= (int32_t)data.size()) FlatVector::SetNull(result, i, true);
+        else result.SetValue(i, Value::INTEGER(data[rank]));
     }
 }
 
-//
-// set_at(set INTEGER[], rank INTEGER) → INTEGER
-// Element at 0-based rank. NULL if out of bounds. O(1).
-//
-static void set_at(
-    DataChunk &args, ExpressionState &, Vector &result)
-{
-    idx_t count = args.size();
-    result.SetVectorType(VectorType::FLAT_VECTOR);
+static void set_from_range(DataChunk &args, ExpressionState &, Vector &result) {
+    idx_t count = args.size(); result.SetVectorType(VectorType::FLAT_VECTOR);
     for (idx_t i = 0; i < count; ++i) {
-        auto sv = args.data[0].GetValue(i);
-        auto rv = args.data[1].GetValue(i);
-        if (sv.IsNull() || rv.IsNull()) {
-            FlatVector::SetNull(result, i, true); continue;
-        }
-        auto data = read_int_list(sv);
-        int32_t rank = rv.GetValue<int32_t>();
-        if (rank < 0 || rank >= (int32_t)data.size())
-            FlatVector::SetNull(result, i, true);
-        else
-            result.SetValue(i, Value::INTEGER(data[rank]));
-    }
-}
-
-//
-// set_from_range(lo INTEGER, hi INTEGER) → INTEGER[]
-// Construct {lo, lo+1, ..., hi}. Useful for testing and for encoding
-// pixel ID ranges.
-//
-static void set_from_range(
-    DataChunk &args, ExpressionState &, Vector &result)
-{
-    idx_t count = args.size();
-    result.SetVectorType(VectorType::FLAT_VECTOR);
-    for (idx_t i = 0; i < count; ++i) {
-        auto lv = args.data[0].GetValue(i);
-        auto hv = args.data[1].GetValue(i);
-        if (lv.IsNull() || hv.IsNull()) {
-            FlatVector::SetNull(result, i, true); continue;
-        }
-        int32_t lo = lv.GetValue<int32_t>();
-        int32_t hi = hv.GetValue<int32_t>();
+        auto lv = args.data[0].GetValue(i); auto hv = args.data[1].GetValue(i);
+        if (lv.IsNull() || hv.IsNull()) { FlatVector::SetNull(result, i, true); continue; }
+        int32_t lo = lv.GetValue<int32_t>(), hi = hv.GetValue<int32_t>();
         std::vector<int32_t> data;
-        data.reserve(std::max(0, hi - lo + 1));
+        data.reserve(std::max(0, hi-lo+1));
         for (int32_t v = lo; v <= hi; ++v) data.push_back(v);
         result.SetValue(i, write_int_list(data));
     }
 }
 
-//
-// set_add(set INTEGER[], element INTEGER) → INTEGER[]
-// Insert element if not already present. O(n) — shifts elements.
-//
-static void set_add(
-    DataChunk &args, ExpressionState &, Vector &result)
-{
-    idx_t count = args.size();
-    result.SetVectorType(VectorType::FLAT_VECTOR);
+static void set_add(DataChunk &args, ExpressionState &, Vector &result) {
+    idx_t count = args.size(); result.SetVectorType(VectorType::FLAT_VECTOR);
     for (idx_t i = 0; i < count; ++i) {
-        auto sv = args.data[0].GetValue(i);
-        auto ev = args.data[1].GetValue(i);
-        if (sv.IsNull() || ev.IsNull()) {
-            FlatVector::SetNull(result, i, true); continue;
-        }
-        auto data = read_int_list(sv);
-        int32_t elem = ev.GetValue<int32_t>();
-        auto it = std::lower_bound(data.begin(), data.end(), elem);
-        if (it == data.end() || *it != elem)
-            data.insert(it, elem);
+        auto sv = args.data[0].GetValue(i); auto ev = args.data[1].GetValue(i);
+        if (sv.IsNull() || ev.IsNull()) { FlatVector::SetNull(result, i, true); continue; }
+        auto data = read_int_list(sv); int32_t elem = ev.GetValue<int32_t>();
+        auto it = std::lower_bound(data.begin(),data.end(),elem);
+        if (it == data.end() || *it != elem) data.insert(it, elem);
         result.SetValue(i, write_int_list(data));
     }
 }
 
-//
-// set_remove(set INTEGER[], element INTEGER) → INTEGER[]
-// Remove element if present. O(n).
-//
-static void set_remove(
-    DataChunk &args, ExpressionState &, Vector &result)
-{
-    idx_t count = args.size();
-    result.SetVectorType(VectorType::FLAT_VECTOR);
+static void set_remove(DataChunk &args, ExpressionState &, Vector &result) {
+    idx_t count = args.size(); result.SetVectorType(VectorType::FLAT_VECTOR);
     for (idx_t i = 0; i < count; ++i) {
-        auto sv = args.data[0].GetValue(i);
-        auto ev = args.data[1].GetValue(i);
-        if (sv.IsNull() || ev.IsNull()) {
-            FlatVector::SetNull(result, i, true); continue;
-        }
-        auto data = read_int_list(sv);
-        int32_t elem = ev.GetValue<int32_t>();
-        auto it = std::lower_bound(data.begin(), data.end(), elem);
+        auto sv = args.data[0].GetValue(i); auto ev = args.data[1].GetValue(i);
+        if (sv.IsNull() || ev.IsNull()) { FlatVector::SetNull(result, i, true); continue; }
+        auto data = read_int_list(sv); int32_t elem = ev.GetValue<int32_t>();
+        auto it = std::lower_bound(data.begin(),data.end(),elem);
         if (it != data.end() && *it == elem) data.erase(it);
         result.SetValue(i, write_int_list(data));
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Load function (NEW STYLE)
+// set_union_agg
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct SetUnionAggState {
+    std::vector<int32_t> *data;  // nullptr = no rows seen yet
+};
+
+struct SetUnionAgg {
+
+    static void Initialize(SetUnionAggState &state) {
+        state.data = nullptr;
+    }
+
+    // Wrapper with exact aggregate_initialize_t signature:
+    //   void (*)(const AggregateFunction&, data_ptr_t)
+    // StateInitialize<> template doesn't resolve cleanly in v1.5.x,
+    // so we provide the function directly.
+    static void InitWrapper(const AggregateFunction &, data_ptr_t state) {
+        reinterpret_cast<SetUnionAggState *>(state)->data = nullptr;
+    }
+
+    static void Update(
+        Vector inputs[], AggregateInputData &,
+        idx_t input_count, Vector &state_vector, idx_t count)
+    {
+        auto states = FlatVector::GetData<SetUnionAggState *>(state_vector);
+        UnifiedVectorFormat idata;
+        inputs[0].ToUnifiedFormat(count, idata);
+
+        for (idx_t i = 0; i < count; ++i) {
+            auto idx = idata.sel->get_index(i);
+            if (!idata.validity.RowIsValid(idx)) continue;
+
+            auto incoming = read_int_list(inputs[0].GetValue(i));
+            auto &st = *states[i];
+
+            if (!st.data) {
+                st.data = new std::vector<int32_t>(std::move(incoming));
+            } else {
+                std::vector<int32_t> merged(st.data->size() + incoming.size());
+                int32_t n = sorted_set::union_(
+                    st.data->data(), (int32_t)st.data->size(),
+                    incoming.data(),  (int32_t)incoming.size(),
+                    merged.data());
+                merged.resize(n);
+                *st.data = std::move(merged);
+            }
+        }
+    }
+
+    static void Combine(
+        Vector &source_vector, Vector &target_vector,
+        AggregateInputData &, idx_t count)
+    {
+        auto sources = FlatVector::GetData<SetUnionAggState *>(source_vector);
+        auto targets = FlatVector::GetData<SetUnionAggState *>(target_vector);
+
+        for (idx_t i = 0; i < count; ++i) {
+            auto &src = *sources[i];
+            auto &tgt = *targets[i];
+            if (!src.data) continue;
+            if (!tgt.data) {
+                tgt.data = src.data;
+                src.data = nullptr;
+                continue;
+            }
+            std::vector<int32_t> merged(tgt.data->size() + src.data->size());
+            int32_t n = sorted_set::union_(
+                tgt.data->data(), (int32_t)tgt.data->size(),
+                src.data->data(), (int32_t)src.data->size(),
+                merged.data());
+            merged.resize(n);
+            *tgt.data = std::move(merged);
+        }
+    }
+
+    static void Finalize(
+        Vector &state_vector, AggregateInputData &,
+        Vector &result, idx_t count, idx_t offset)
+    {
+        auto states = FlatVector::GetData<SetUnionAggState *>(state_vector);
+        for (idx_t i = 0; i < count; ++i) {
+            auto &st = *states[i];
+            if (!st.data)
+                FlatVector::SetNull(result, i + offset, true);
+            else
+                result.SetValue(i + offset, write_int_list(*st.data));
+        }
+    }
+
+    static void Destroy(Vector &state_vector, AggregateInputData &, idx_t count) {
+        auto states = FlatVector::GetData<SetUnionAggState *>(state_vector);
+        for (idx_t i = 0; i < count; ++i) {
+            delete states[i]->data;
+            states[i]->data = nullptr;
+        }
+    }
+
+    static AggregateFunction GetFunction() {
+        AggregateFunction func(
+            {LogicalType::LIST(LogicalType::INTEGER)},
+            LogicalType::LIST(LogicalType::INTEGER),
+            AggregateFunction::StateSize<SetUnionAggState>,  // idx_t (*)() — fine as-is
+            InitWrapper,    // void (*)(const AggregateFunction&, data_ptr_t)
+            Update,
+            Combine,
+            Finalize,
+            nullptr,        // simple_update
+            nullptr,        // bind
+            Destroy         // void (*)(Vector&, AggregateInputData&, idx_t) — matches directly
+        );
+        func.name = "set_union_agg";
+        return func;
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// set_intersect_agg
+//
+// The critical design point: we CANNOT use an empty set as the identity
+// element for intersection because ∅ ∩ X = ∅ for all X. Instead:
+//   - state.data == nullptr means "no rows seen yet"
+//   - First non-null row SEEDS the state (copies the set directly)
+//   - All subsequent rows INTERSECT with the running state
+//   - NULL rows are skipped (standard SQL aggregate semantics)
+//   - Empty intersection short-circuits (result can only stay empty)
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct SetIntersectAggState {
+    std::vector<int32_t> *data;  // nullptr = no rows seen yet
+};
+
+struct SetIntersectAgg {
+
+    static void Initialize(SetIntersectAggState &state) {
+        state.data = nullptr;
+    }
+
+    // Same pattern: plain wrapper avoids StateInitialize template resolution issues
+    static void InitWrapper(const AggregateFunction &, data_ptr_t state) {
+        reinterpret_cast<SetIntersectAggState *>(state)->data = nullptr;
+    }
+
+    static void Update(
+        Vector inputs[], AggregateInputData &,
+        idx_t input_count, Vector &state_vector, idx_t count)
+    {
+        auto states = FlatVector::GetData<SetIntersectAggState *>(state_vector);
+        UnifiedVectorFormat idata;
+        inputs[0].ToUnifiedFormat(count, idata);
+
+        for (idx_t i = 0; i < count; ++i) {
+            auto idx = idata.sel->get_index(i);
+            if (!idata.validity.RowIsValid(idx)) continue;
+
+            auto &st = *states[i];
+
+            // Early exit: once intersection is empty it stays empty
+            if (st.data && st.data->empty()) continue;
+
+            auto incoming = read_int_list(inputs[0].GetValue(i));
+
+            if (!st.data) {
+                // First row: seed the state
+                st.data = new std::vector<int32_t>(std::move(incoming));
+            } else {
+                // Subsequent rows: intersect in-place
+                std::vector<int32_t> inter(std::min(st.data->size(), incoming.size()));
+                int32_t n = sorted_set::intersect(
+                    st.data->data(), (int32_t)st.data->size(),
+                    incoming.data(),  (int32_t)incoming.size(),
+                    inter.data());
+                inter.resize(n);
+                *st.data = std::move(inter);
+            }
+        }
+    }
+
+    static void Combine(
+        Vector &source_vector, Vector &target_vector,
+        AggregateInputData &, idx_t count)
+    {
+        auto sources = FlatVector::GetData<SetIntersectAggState *>(source_vector);
+        auto targets = FlatVector::GetData<SetIntersectAggState *>(target_vector);
+
+        for (idx_t i = 0; i < count; ++i) {
+            auto &src = *sources[i];
+            auto &tgt = *targets[i];
+
+            if (!src.data) continue;  // source saw no rows
+
+            if (!tgt.data) {
+                // Target saw no rows: adopt source's partial result
+                tgt.data = src.data;
+                src.data = nullptr;
+                continue;
+            }
+
+            // Both have partial results: intersect them
+            std::vector<int32_t> inter(std::min(tgt.data->size(), src.data->size()));
+            int32_t n = sorted_set::intersect(
+                tgt.data->data(), (int32_t)tgt.data->size(),
+                src.data->data(), (int32_t)src.data->size(),
+                inter.data());
+            inter.resize(n);
+            *tgt.data = std::move(inter);
+        }
+    }
+
+    static void Finalize(
+        Vector &state_vector, AggregateInputData &,
+        Vector &result, idx_t count, idx_t offset)
+    {
+        auto states = FlatVector::GetData<SetIntersectAggState *>(state_vector);
+        for (idx_t i = 0; i < count; ++i) {
+            auto &st = *states[i];
+            if (!st.data)
+                FlatVector::SetNull(result, i + offset, true);  // no rows → NULL
+            else
+                result.SetValue(i + offset, write_int_list(*st.data));
+        }
+    }
+
+    static void Destroy(Vector &state_vector, AggregateInputData &, idx_t count) {
+        auto states = FlatVector::GetData<SetIntersectAggState *>(state_vector);
+        for (idx_t i = 0; i < count; ++i) {
+            delete states[i]->data;
+            states[i]->data = nullptr;
+        }
+    }
+
+    static AggregateFunction GetFunction() {
+        AggregateFunction func(
+            {LogicalType::LIST(LogicalType::INTEGER)},
+            LogicalType::LIST(LogicalType::INTEGER),
+            AggregateFunction::StateSize<SetIntersectAggState>,  // fine as-is
+            InitWrapper,    // plain wrapper — no StateInitialize template
+            Update,
+            Combine,
+            Finalize,
+            nullptr,        // simple_update
+            nullptr,        // bind
+            Destroy         // signature matches aggregate_destructor_t directly
+        );
+        func.name = "set_intersect_agg";
+        return func;
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Load
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void LoadInternal(ExtensionLoader &loader) {
 
-    // ── Constructor ─────────────────────────────────────────────────────
-    loader.RegisterFunction(ScalarFunction(
-        "sorted_set",
+    loader.RegisterFunction(ScalarFunction("sorted_set",
         {LogicalType::LIST(LogicalType::INTEGER)},
-        LogicalType::LIST(LogicalType::INTEGER),
-        sorted_set_ctor));
+        LogicalType::LIST(LogicalType::INTEGER), sorted_set_ctor));
 
-    loader.RegisterFunction(ScalarFunction(
-        "set_from_range",
+    loader.RegisterFunction(ScalarFunction("set_from_range",
         {LogicalType::INTEGER, LogicalType::INTEGER},
-        LogicalType::LIST(LogicalType::INTEGER),
-        set_from_range));
+        LogicalType::LIST(LogicalType::INTEGER), set_from_range));
 
-    // ── Predicates ──────────────────────────────────────────────────────
-    loader.RegisterFunction(ScalarFunction(
-        "set_is_valid",
+    loader.RegisterFunction(ScalarFunction("set_is_valid",
         {LogicalType::LIST(LogicalType::INTEGER)},
-        LogicalType::BOOLEAN,
-        set_is_valid));
+        LogicalType::BOOLEAN, set_is_valid));
 
-    loader.RegisterFunction(ScalarFunction(
-        "set_contains",
+    loader.RegisterFunction(ScalarFunction("set_contains",
         {LogicalType::LIST(LogicalType::INTEGER), LogicalType::INTEGER},
-        LogicalType::BOOLEAN,
-        set_contains));
+        LogicalType::BOOLEAN, set_contains));
 
-    loader.RegisterFunction(ScalarFunction(
-        "set_equal",
+    loader.RegisterFunction(ScalarFunction("set_equal",
         {LogicalType::LIST(LogicalType::INTEGER), LogicalType::LIST(LogicalType::INTEGER)},
         LogicalType::BOOLEAN,
-        [](DataChunk &args, ExpressionState &state, Vector &result) {
-            ExecuteBinaryPredicate(args, state, result, sorted_set::equal);
-        }));
+        [](DataChunk &args, ExpressionState &s, Vector &r) {
+            ExecuteBinaryPredicate(args, s, r, sorted_set::equal); }));
 
-    loader.RegisterFunction(ScalarFunction(
-        "set_subset_of",
+    loader.RegisterFunction(ScalarFunction("set_subset_of",
         {LogicalType::LIST(LogicalType::INTEGER), LogicalType::LIST(LogicalType::INTEGER)},
         LogicalType::BOOLEAN,
-        [](DataChunk &args, ExpressionState &state, Vector &result) {
-            ExecuteBinaryPredicate(args, state, result, sorted_set::subset_of);
-        }));
+        [](DataChunk &args, ExpressionState &s, Vector &r) {
+            ExecuteBinaryPredicate(args, s, r, sorted_set::subset_of); }));
 
-    loader.RegisterFunction(ScalarFunction(
-        "set_superset_of",
+    loader.RegisterFunction(ScalarFunction("set_superset_of",
         {LogicalType::LIST(LogicalType::INTEGER), LogicalType::LIST(LogicalType::INTEGER)},
         LogicalType::BOOLEAN,
-        [](DataChunk &args, ExpressionState &state, Vector &result) {
-            ExecuteBinaryPredicate(args, state, result, sorted_set::superset_of);
-        }));
+        [](DataChunk &args, ExpressionState &s, Vector &r) {
+            ExecuteBinaryPredicate(args, s, r, sorted_set::superset_of); }));
 
-    loader.RegisterFunction(ScalarFunction(
-        "set_disjoint",
+    loader.RegisterFunction(ScalarFunction("set_disjoint",
         {LogicalType::LIST(LogicalType::INTEGER), LogicalType::LIST(LogicalType::INTEGER)},
         LogicalType::BOOLEAN,
-        [](DataChunk &args, ExpressionState &state, Vector &result) {
-            ExecuteBinaryPredicate(args, state, result, sorted_set::disjoint);
-        }));
+        [](DataChunk &args, ExpressionState &s, Vector &r) {
+            ExecuteBinaryPredicate(args, s, r, sorted_set::disjoint); }));
 
-    // ── Set Operations ──────────────────────────────────────────────────
-    loader.RegisterFunction(ScalarFunction(
-        "set_intersect",
+    loader.RegisterFunction(ScalarFunction("set_intersect",
         {LogicalType::LIST(LogicalType::INTEGER), LogicalType::LIST(LogicalType::INTEGER)},
         LogicalType::LIST(LogicalType::INTEGER),
-        [](DataChunk &args, ExpressionState &state, Vector &result) {
-            ExecuteBinarySetOp(args, state, result, sorted_set::intersect);
-        }));
+        [](DataChunk &args, ExpressionState &s, Vector &r) {
+            ExecuteBinarySetOp(args, s, r, sorted_set::intersect); }));
 
-    loader.RegisterFunction(ScalarFunction(
-        "set_union",
+    loader.RegisterFunction(ScalarFunction("set_union",
         {LogicalType::LIST(LogicalType::INTEGER), LogicalType::LIST(LogicalType::INTEGER)},
         LogicalType::LIST(LogicalType::INTEGER),
-        [](DataChunk &args, ExpressionState &state, Vector &result) {
-            ExecuteBinarySetOp(args, state, result, sorted_set::union_);
-        }));
+        [](DataChunk &args, ExpressionState &s, Vector &r) {
+            ExecuteBinarySetOp(args, s, r, sorted_set::union_); }));
 
-    loader.RegisterFunction(ScalarFunction(
-        "set_subtract",
+    loader.RegisterFunction(ScalarFunction("set_subtract",
         {LogicalType::LIST(LogicalType::INTEGER), LogicalType::LIST(LogicalType::INTEGER)},
         LogicalType::LIST(LogicalType::INTEGER),
-        [](DataChunk &args, ExpressionState &state, Vector &result) {
-            ExecuteBinarySetOp(args, state, result, sorted_set::subtract);
-        }));
+        [](DataChunk &args, ExpressionState &s, Vector &r) {
+            ExecuteBinarySetOp(args, s, r, sorted_set::subtract); }));
 
-    loader.RegisterFunction(ScalarFunction(
-        "set_symmetric_diff",
+    loader.RegisterFunction(ScalarFunction("set_symmetric_diff",
         {LogicalType::LIST(LogicalType::INTEGER), LogicalType::LIST(LogicalType::INTEGER)},
         LogicalType::LIST(LogicalType::INTEGER),
-        [](DataChunk &args, ExpressionState &state, Vector &result) {
-            ExecuteBinarySetOp(args, state, result, sorted_set::symmetric_diff);
-        }));
+        [](DataChunk &args, ExpressionState &s, Vector &r) {
+            ExecuteBinarySetOp(args, s, r, sorted_set::symmetric_diff); }));
 
-    // ── Scalar Accessors ────────────────────────────────────────────────
-    loader.RegisterFunction(ScalarFunction("set_size",         {LogicalType::LIST(LogicalType::INTEGER)}, LogicalType::INTEGER, set_size));
-    loader.RegisterFunction(ScalarFunction("set_min",          {LogicalType::LIST(LogicalType::INTEGER)}, LogicalType::INTEGER, set_min));
-    loader.RegisterFunction(ScalarFunction("set_max",          {LogicalType::LIST(LogicalType::INTEGER)}, LogicalType::INTEGER, set_max));
-    loader.RegisterFunction(ScalarFunction("set_intersect_size",{LogicalType::LIST(LogicalType::INTEGER), LogicalType::LIST(LogicalType::INTEGER)}, LogicalType::INTEGER, set_intersect_size));
-    loader.RegisterFunction(ScalarFunction("set_rank",         {LogicalType::LIST(LogicalType::INTEGER), LogicalType::INTEGER}, LogicalType::INTEGER, set_rank));
-    loader.RegisterFunction(ScalarFunction("set_at",           {LogicalType::LIST(LogicalType::INTEGER), LogicalType::INTEGER}, LogicalType::INTEGER, set_at));
-
-    // ── Mutation ────────────────────────────────────────────────────────
-    loader.RegisterFunction(ScalarFunction(
-        "set_add",
+    loader.RegisterFunction(ScalarFunction("set_size",
+        {LogicalType::LIST(LogicalType::INTEGER)}, LogicalType::INTEGER, set_size));
+    loader.RegisterFunction(ScalarFunction("set_min",
+        {LogicalType::LIST(LogicalType::INTEGER)}, LogicalType::INTEGER, set_min));
+    loader.RegisterFunction(ScalarFunction("set_max",
+        {LogicalType::LIST(LogicalType::INTEGER)}, LogicalType::INTEGER, set_max));
+    loader.RegisterFunction(ScalarFunction("set_intersect_size",
+        {LogicalType::LIST(LogicalType::INTEGER), LogicalType::LIST(LogicalType::INTEGER)},
+        LogicalType::INTEGER, set_intersect_size));
+    loader.RegisterFunction(ScalarFunction("set_rank",
         {LogicalType::LIST(LogicalType::INTEGER), LogicalType::INTEGER},
-        LogicalType::LIST(LogicalType::INTEGER),
-        set_add));
-
-    loader.RegisterFunction(ScalarFunction(
-        "set_remove",
+        LogicalType::INTEGER, set_rank));
+    loader.RegisterFunction(ScalarFunction("set_at",
         {LogicalType::LIST(LogicalType::INTEGER), LogicalType::INTEGER},
-        LogicalType::LIST(LogicalType::INTEGER),
-        set_remove));
+        LogicalType::INTEGER, set_at));
+    loader.RegisterFunction(ScalarFunction("set_add",
+        {LogicalType::LIST(LogicalType::INTEGER), LogicalType::INTEGER},
+        LogicalType::LIST(LogicalType::INTEGER), set_add));
+    loader.RegisterFunction(ScalarFunction("set_remove",
+        {LogicalType::LIST(LogicalType::INTEGER), LogicalType::INTEGER},
+        LogicalType::LIST(LogicalType::INTEGER), set_remove));
+
+    // ── Aggregates ────────────────────────────────────────────────────────────
+    loader.RegisterFunction(SetUnionAgg::GetFunction());
+    loader.RegisterFunction(SetIntersectAgg::GetFunction());
 }
 
 void SortedSetExtension::Load(ExtensionLoader &loader) {
     LoadInternal(loader);
 }
 
-std::string SortedSetExtension::Name() {
-    return "sorted_set";
-}
-
-std::string SortedSetExtension::Version() const {
-    return "v0.1.0";
-}
+std::string SortedSetExtension::Name() { return "sorted_set"; }
+std::string SortedSetExtension::Version() const { return "v0.1.0"; }
 
 } // namespace duckdb
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Extension entry point
-// ─────────────────────────────────────────────────────────────────────────────
-
 extern "C" {
-
 DUCKDB_CPP_EXTENSION_ENTRY(sorted_set, loader) {
     duckdb::LoadInternal(loader);
 }
-
-} // extern "C"
+}

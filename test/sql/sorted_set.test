@@ -4,16 +4,19 @@ require sorted_set
 
 # ── Construction ──────────────────────────────────────────────────────────────
 
+# sorted_set() sorts and deduplicates
 query I
 SELECT sorted_set([3, 1, 2, 1, 3]::INTEGER[])
 ----
 [1, 2, 3]
 
+# Already sorted stays sorted
 query I
 SELECT sorted_set([1, 2, 3]::INTEGER[])
 ----
 [1, 2, 3]
 
+# Empty list
 query I
 SELECT sorted_set([]::INTEGER[])
 ----
@@ -397,3 +400,177 @@ SELECT feat_id FROM step1 WHERE set_equal(inter, (SELECT s FROM target))
 ----
 1
 4
+
+
+# ── set_union_agg ─────────────────────────────────────────────────────────────
+
+# Basic union across rows
+query I
+SELECT set_union_agg(px) FROM (VALUES
+    ([1,3,5]::INTEGER[]),
+    ([2,4,6]::INTEGER[]),
+    ([3,5,7]::INTEGER[])
+) t(px)
+----
+[1, 2, 3, 4, 5, 6, 7]
+
+# Single row
+query I
+SELECT set_union_agg(px) FROM (VALUES ([1,2,3]::INTEGER[])) t(px)
+----
+[1, 2, 3]
+
+# NULL rows are skipped
+query I
+SELECT set_union_agg(px) FROM (VALUES
+    ([1,2]::INTEGER[]),
+    (NULL::INTEGER[]),
+    ([3,4]::INTEGER[])
+) t(px)
+----
+[1, 2, 3, 4]
+
+# All NULL → NULL
+query I
+SELECT set_union_agg(px) FROM (VALUES (NULL::INTEGER[]), (NULL::INTEGER[])) t(px)
+----
+NULL
+
+# Empty group → NULL
+query I
+SELECT set_union_agg(px) FROM (VALUES ([1]::INTEGER[])) t(px) WHERE false
+----
+NULL
+
+# GROUP BY — union within each group
+query II rowsort
+SELECT grp, set_union_agg(px) FROM (VALUES
+    (1, [1,2]::INTEGER[]),
+    (1, [2,3]::INTEGER[]),
+    (2, [10,11]::INTEGER[]),
+    (2, [11,12]::INTEGER[])
+) t(grp, px)
+GROUP BY grp
+----
+1	[1, 2, 3]
+2	[10, 11, 12]
+
+# Result is a valid sorted set (no duplicates, sorted)
+query I
+SELECT set_is_valid(set_union_agg(px)) FROM (VALUES
+    ([1,2,3]::INTEGER[]),
+    ([4,5]::INTEGER[])
+) t(px)
+----
+true
+
+# Coverage check: union of all features covers their individual members
+query I
+SELECT set_superset_of(
+    set_union_agg(px),
+    sorted_set([1,2,3,4,5,6]::INTEGER[])
+) FROM (VALUES
+    ([1,2,3]::INTEGER[]),
+    ([4,5,6]::INTEGER[])
+) t(px)
+----
+true
+
+
+# ── set_intersect_agg ─────────────────────────────────────────────────────────
+
+# Basic intersection across rows — common elements only
+query I
+SELECT set_intersect_agg(px) FROM (VALUES
+    ([1,2,3,4]::INTEGER[]),
+    ([2,3,4,5]::INTEGER[]),
+    ([3,4,5,6]::INTEGER[])
+) t(px)
+----
+[3, 4]
+
+# Single row — returns that row's set
+query I
+SELECT set_intersect_agg(px) FROM (VALUES ([1,2,3]::INTEGER[])) t(px)
+----
+[1, 2, 3]
+
+# Disjoint sets — intersection is empty (not NULL)
+query I
+SELECT set_intersect_agg(px) FROM (VALUES
+    ([1,2]::INTEGER[]),
+    ([3,4]::INTEGER[])
+) t(px)
+----
+[]
+
+# NULL rows are skipped (don't contribute to intersection)
+# Without NULLs: {1,2,3} ∩ {2,3,4} = {2,3}
+query I
+SELECT set_intersect_agg(px) FROM (VALUES
+    ([1,2,3]::INTEGER[]),
+    (NULL::INTEGER[]),
+    ([2,3,4]::INTEGER[])
+) t(px)
+----
+[2, 3]
+
+# All NULL → NULL (no rows contributed)
+query I
+SELECT set_intersect_agg(px) FROM (VALUES (NULL::INTEGER[]), (NULL::INTEGER[])) t(px)
+----
+NULL
+
+# Empty group → NULL
+query I
+SELECT set_intersect_agg(px) FROM (VALUES ([1]::INTEGER[])) t(px) WHERE false
+----
+NULL
+
+# GROUP BY — intersection within each group
+query II rowsort
+SELECT grp, set_intersect_agg(px) FROM (VALUES
+    (1, [1,2,3]::INTEGER[]),
+    (1, [2,3,4]::INTEGER[]),
+    (2, [10,11,12]::INTEGER[]),
+    (2, [11,12,13]::INTEGER[])
+) t(grp, px)
+GROUP BY grp
+----
+1	[2, 3]
+2	[11, 12]
+
+# Result is a valid sorted set
+query I
+SELECT set_is_valid(set_intersect_agg(px)) FROM (VALUES
+    ([1,2,3,4]::INTEGER[]),
+    ([2,3,4,5]::INTEGER[])
+) t(px)
+----
+true
+
+# Intersection is subset of every input
+query I
+WITH agg AS (
+    SELECT set_intersect_agg(px) AS inter FROM (VALUES
+        ([1,2,3]::INTEGER[]),
+        ([2,3,4]::INTEGER[]),
+        ([3,4,5]::INTEGER[])
+    ) t(px)
+)
+SELECT set_subset_of(inter, [1,2,3]::INTEGER[])
+    AND set_subset_of(inter, [2,3,4]::INTEGER[])
+    AND set_subset_of(inter, [3,4,5]::INTEGER[])
+FROM agg
+----
+true
+
+# Combined: union then intersect
+# union({1,2},{3,4}) = {1,2,3,4}; intersect with {2,3} = {2,3}
+query I
+SELECT set_intersect(
+    set_union_agg(px),
+    [2,3]::INTEGER[]
+) FROM (VALUES ([1,2]::INTEGER[]), ([3,4]::INTEGER[])) t(px)
+----
+[2, 3]

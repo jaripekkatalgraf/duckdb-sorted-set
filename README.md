@@ -1,10 +1,28 @@
 # sorted_set
 
-A DuckDB extension providing native sorted integer set operations with O(n+m) merge-based algorithms.
+A DuckDB extension providing O(n+m) merge-based set operations on sorted integer arrays.
 
-DuckDB's built-in `list_intersect`, `list_union`, and related functions operate on unsorted lists and use O(n×m) nested-loop algorithms. When your lists are known to be sorted and deduplicated — coverage arrays, pixel ID sets, document term lists — this extension provides the same operations with O(n+m) merge-based implementations that exploit the sorted invariant.
+DuckDB's built-in `list_intersect`, `list_union`, and related functions are designed for unsorted lists and use O(n×m) algorithms. When your arrays are sorted and deduplicated — coverage maps, pixel ID sets, document term lists, permission bitsets — this extension provides the same operations in O(n+m) by exploiting the sorted invariant.
 
-The extension uses the same `INTEGER[]` storage as DuckDB's standard list type, so sorted sets interoperate freely with all existing list functions.
+Storage is identical to DuckDB's standard `INTEGER[]` type, so sorted sets interoperate freely with all existing list functions and tooling.
+
+---
+
+## The contract
+
+**All operations assume sorted, deduplicated input.** Call `sorted_set()` once at write time; every subsequent operation is O(n+m) with no sorting overhead.
+
+```sql
+-- Write once: O(n log n) to sort and dedup
+INSERT INTO coverage SELECT id, sorted_set(list(pixel_id)) FROM raw;
+
+-- Read many: all operations are O(n+m)
+SELECT set_intersect(a.px, b.px) FROM coverage a, coverage b ...
+```
+
+Passing unsorted arrays to any function other than `sorted_set()` produces incorrect results. Use `set_is_valid()` to validate data during development.
+
+---
 
 ## Installation
 
@@ -18,245 +36,167 @@ GEN=ninja make
 LOAD 'build/release/extension/sorted_set/sorted_set.duckdb_extension';
 ```
 
+---
+
 ## Functions
 
 ### Construction
 
 **`sorted_set(arr INTEGER[]) → INTEGER[]`**
-
-Construct a valid sorted set from any integer array. Sorts and deduplicates in O(n log n). This is the constructor — call it once at insert time, then all subsequent operations are O(n+m).
+Sort and deduplicate any integer array. O(n log n). This is the only function that accepts unsorted input.
 
 ```sql
-SELECT sorted_set([3, 1, 2, 1, 3]::INTEGER[]);  -- → [1, 2, 3]
-SELECT sorted_set([]);                            -- → []
+SELECT sorted_set([3, 1, 2, 1, 3]::INTEGER[]);  -- [1, 2, 3]
+SELECT sorted_set([]);                            -- []
 ```
 
 **`set_from_range(lo INTEGER, hi INTEGER) → INTEGER[]`**
-
-Construct the set {lo, lo+1, ..., hi}. Returns empty set if lo > hi.
+Construct {lo, lo+1, ..., hi}. Returns empty if lo > hi.
 
 ```sql
-SELECT set_from_range(0, 4);   -- → [0, 1, 2, 3, 4]
-SELECT set_from_range(5, 3);   -- → []
+SELECT set_from_range(1, 5);  -- [1, 2, 3, 4, 5]
+SELECT set_from_range(5, 3);  -- []
 ```
 
 **`set_is_valid(arr INTEGER[]) → BOOLEAN`**
-
-Returns true if the array is already sorted and contains no duplicates. Useful for validating data at insert time.
+True if the array is sorted and has no duplicates. Use this to validate data, not to enforce it at runtime.
 
 ```sql
-SELECT set_is_valid([1, 2, 3]::INTEGER[]);  -- → true
-SELECT set_is_valid([3, 1, 2]::INTEGER[]);  -- → false  (not sorted)
-SELECT set_is_valid([1, 1, 2]::INTEGER[]);  -- → false  (duplicate)
+SELECT set_is_valid([1, 2, 3]::INTEGER[]);  -- true
+SELECT set_is_valid([3, 1, 2]::INTEGER[]);  -- false
+SELECT set_is_valid([1, 1, 2]::INTEGER[]);  -- false
 ```
 
 ---
 
 ### Predicates
 
-All predicate functions return NULL if either input is NULL.
+All return NULL if either input is NULL.
 
-**`set_contains(s INTEGER[], x INTEGER) → BOOLEAN`**
+**`set_contains(s INTEGER[], x INTEGER) → BOOLEAN`** — binary search, O(log n)
 
-Binary search. O(log n).
+**`set_equal(a INTEGER[], b INTEGER[]) → BOOLEAN`** — memcmp after size check, O(n)
 
-```sql
-SELECT set_contains([1, 3, 5, 7]::INTEGER[], 3);  -- → true
-SELECT set_contains([1, 3, 5, 7]::INTEGER[], 4);  -- → false
-```
+**`set_subset_of(a INTEGER[], b INTEGER[]) → BOOLEAN`** — a ⊆ b, merge walk O(n+m)
 
-**`set_equal(a INTEGER[], b INTEGER[]) → BOOLEAN`**
+**`set_superset_of(a INTEGER[], b INTEGER[]) → BOOLEAN`** — a ⊇ b, equivalent to `set_subset_of(b, a)`
 
-True if both sets contain exactly the same elements. O(n) — memcmp after size check.
+**`set_disjoint(a INTEGER[], b INTEGER[]) → BOOLEAN`** — no shared elements, O(n+m)
 
 ```sql
-SELECT set_equal([1, 2, 3]::INTEGER[], [1, 2, 3]::INTEGER[]);  -- → true
-SELECT set_equal([1, 2]::INTEGER[], [1, 2, 3]::INTEGER[]);     -- → false
-```
-
-**`set_subset_of(a INTEGER[], b INTEGER[]) → BOOLEAN`**
-
-True if every element of `a` appears in `b` (a ⊆ b). O(n+m) merge walk — faster than repeated `set_contains` calls.
-
-```sql
-SELECT set_subset_of([1, 2]::INTEGER[], [1, 2, 3]::INTEGER[]);  -- → true
-SELECT set_subset_of([1, 4]::INTEGER[], [1, 2, 3]::INTEGER[]);  -- → false
-SELECT set_subset_of([]::INTEGER[], [1, 2, 3]::INTEGER[]);      -- → true
-```
-
-**`set_superset_of(a INTEGER[], b INTEGER[]) → BOOLEAN`**
-
-True if `a` contains every element of `b` (a ⊇ b). Equivalent to `set_subset_of(b, a)`.
-
-```sql
-SELECT set_superset_of([1, 2, 3]::INTEGER[], [1, 2]::INTEGER[]);  -- → true
-```
-
-**`set_disjoint(a INTEGER[], b INTEGER[]) → BOOLEAN`**
-
-True if `a` and `b` share no elements. O(n+m).
-
-```sql
-SELECT set_disjoint([1, 2]::INTEGER[], [3, 4]::INTEGER[]);     -- → true
-SELECT set_disjoint([1, 2, 3]::INTEGER[], [3, 4]::INTEGER[]);  -- → false
+SELECT set_contains([1,3,5,7]::INTEGER[], 3);               -- true
+SELECT set_subset_of([1,2]::INTEGER[], [1,2,3]::INTEGER[]); -- true
+SELECT set_disjoint([1,2]::INTEGER[], [3,4]::INTEGER[]);    -- true
 ```
 
 ---
 
-### Set Operations
+### Set operations
 
-All operations return a new sorted set. Both inputs must be valid sorted sets (produced by `sorted_set()` or known-sorted data). Results are always sorted and deduplicated.
+All return a new sorted set. Both inputs must be valid sorted sets.
 
-**`set_intersect(a INTEGER[], b INTEGER[]) → INTEGER[]`**
+**`set_intersect(a, b) → INTEGER[]`** — elements in both. O(n+m)
 
-Elements in both a and b. O(n+m).
+**`set_union(a, b) → INTEGER[]`** — elements in either. O(n+m)
 
-```sql
-SELECT set_intersect([1,2,3,4]::INTEGER[], [2,4,6]::INTEGER[]);
--- → [2, 4]
-```
+**`set_subtract(a, b) → INTEGER[]`** — a \ b. O(n+m)
 
-**`set_union(a INTEGER[], b INTEGER[]) → INTEGER[]`**
-
-Elements in either a or b. O(n+m).
+**`set_symmetric_diff(a, b) → INTEGER[]`** — elements in exactly one. O(n+m)
 
 ```sql
-SELECT set_union([1,3,5]::INTEGER[], [2,4,6]::INTEGER[]);
--- → [1, 2, 3, 4, 5, 6]
-```
-
-**`set_subtract(a INTEGER[], b INTEGER[]) → INTEGER[]`**
-
-Elements in a but not in b (a \ b). O(n+m).
-
-```sql
-SELECT set_subtract([1,2,3,4]::INTEGER[], [2,4]::INTEGER[]);
--- → [1, 3]
-```
-
-**`set_symmetric_diff(a INTEGER[], b INTEGER[]) → INTEGER[]`**
-
-Elements in exactly one of a or b. O(n+m).
-
-```sql
-SELECT set_symmetric_diff([1,2,3]::INTEGER[], [2,3,4]::INTEGER[]);
--- → [1, 4]
+SELECT set_intersect([1,2,3,4]::INTEGER[], [2,4,6]::INTEGER[]);   -- [2, 4]
+SELECT set_union([1,3,5]::INTEGER[], [2,4,6]::INTEGER[]);          -- [1, 2, 3, 4, 5, 6]
+SELECT set_subtract([1,2,3,4]::INTEGER[], [2,4]::INTEGER[]);       -- [1, 3]
+SELECT set_symmetric_diff([1,2,3]::INTEGER[], [2,3,4]::INTEGER[]); -- [1, 4]
 ```
 
 ---
 
-### Scalar Accessors
+### Aggregates
 
-**`set_size(s INTEGER[]) → INTEGER`**
+Inputs must be valid sorted sets. Pass unsorted data through `sorted_set()` first.
 
-Number of elements. Equivalent to `cardinality(s)`.
-
-**`set_min(s INTEGER[]) → INTEGER`**
-
-Minimum element. O(1) — first element of sorted array. NULL for empty set.
-
-**`set_max(s INTEGER[]) → INTEGER`**
-
-Maximum element. O(1) — last element of sorted array. NULL for empty set.
-
-**`set_intersect_size(a INTEGER[], b INTEGER[]) → INTEGER`**
-
-Size of the intersection without materialising it. O(n+m). Use in `WHERE` and `HAVING` clauses to filter by overlap count without the allocation cost of `set_intersect`.
+**`set_union_agg(px INTEGER[]) → INTEGER[]`**
+Union of all sets in a group. NULL rows are skipped; empty group returns NULL.
 
 ```sql
--- Features that share at least 3 pixels with target
-SELECT feat_id FROM coverage
-WHERE set_intersect_size(px, $target) >= 3;
+-- All pixels covered by any feature in a group
+SELECT category, set_union_agg(px) AS total_coverage
+FROM feature_coverage
+GROUP BY category;
 ```
 
-**`set_rank(s INTEGER[], x INTEGER) → INTEGER`**
-
-Zero-based position of `x` in `s`. Returns -1 if not present. O(log n).
+**`set_intersect_agg(px INTEGER[]) → INTEGER[]`**
+Intersection of all sets in a group. NULL rows are skipped; empty group returns NULL.
+The first non-null row seeds the state — there is no identity element for intersection.
 
 ```sql
-SELECT set_rank([10, 20, 30, 40]::INTEGER[], 20);  -- → 1
-SELECT set_rank([10, 20, 30, 40]::INTEGER[], 25);  -- → -1
+-- Pixels common to every feature in a group
+SELECT group_id, set_intersect_agg(px) AS common_pixels
+FROM experiment_features
+GROUP BY group_id;
 ```
 
-**`set_at(s INTEGER[], rank INTEGER) → INTEGER`**
+---
 
-Element at zero-based rank. Returns NULL if rank is out of bounds. O(1).
+### Scalar accessors
 
-```sql
-SELECT set_at([10, 20, 30, 40]::INTEGER[], 2);   -- → 30
-SELECT set_at([10, 20, 30, 40]::INTEGER[], 99);  -- → NULL
-```
+**`set_size(s) → INTEGER`** — element count
+
+**`set_min(s) → INTEGER`** — minimum element, O(1). NULL for empty set.
+
+**`set_max(s) → INTEGER`** — maximum element, O(1). NULL for empty set.
+
+**`set_intersect_size(a, b) → INTEGER`** — intersection size without materialising. O(n+m). Prefer this in WHERE/HAVING over `cardinality(set_intersect(a, b))`.
+
+**`set_rank(s, x) → INTEGER`** — zero-based position of x. Returns -1 if absent. O(log n).
+
+**`set_at(s, rank) → INTEGER`** — element at zero-based rank. NULL if out of bounds. O(1).
 
 ---
 
 ### Mutation
 
-These return new sets — DuckDB values are immutable. Both are O(n) due to array shifting; for bulk modifications prefer `sorted_set(array_append(...))`.
+Both return a new set. O(n) due to shifting; for bulk changes prefer `sorted_set(array_append(...))`.
 
-**`set_add(s INTEGER[], x INTEGER) → INTEGER[]`**
+**`set_add(s, x) → INTEGER[]`** — insert x in sorted position. No-op if present.
 
-Insert `x` at the correct sorted position. No-op if already present.
-
-```sql
-SELECT set_add([1, 3, 5]::INTEGER[], 4);  -- → [1, 3, 4, 5]
-SELECT set_add([1, 3, 5]::INTEGER[], 3);  -- → [1, 3, 5]   (no-op)
-```
-
-**`set_remove(s INTEGER[], x INTEGER) → INTEGER[]`**
-
-Remove `x` if present. No-op if absent.
+**`set_remove(s, x) → INTEGER[]`** — remove x. No-op if absent.
 
 ```sql
-SELECT set_remove([1, 2, 3, 4]::INTEGER[], 3);  -- → [1, 2, 4]
-SELECT set_remove([1, 2, 3]::INTEGER[], 99);    -- → [1, 2, 3]
+SELECT set_add([1,3,5]::INTEGER[], 4);      -- [1, 3, 4, 5]
+SELECT set_remove([1,2,3,4]::INTEGER[], 3); -- [1, 2, 4]
 ```
 
 ---
 
-## Usage patterns
+## Patterns
 
-### Storing sorted sets in a table
+### Superset queries
 
-Construct once at insert time using `sorted_set()`. All subsequent reads and operations are O(n+m).
-
-```sql
-CREATE TABLE feature_coverage (
-    feat_id  INTEGER PRIMARY KEY,
-    px       INTEGER[]    -- maintained as sorted set
-);
-
--- Insert: normalise at write time
-INSERT INTO feature_coverage
-SELECT feat_id, sorted_set(list(pixel_id))
-FROM raw_pixels
-GROUP BY feat_id;
-```
-
-### Superset queries: which features cover all target pixels?
-
-The core operation in predicate search — find features whose coverage is a superset of the target set S.
+Find rows whose coverage contains all target elements.
 
 ```sql
--- Replaces: WHERE list_has_all(px, $s)  (O(n*m) unsorted)
--- With:     WHERE set_subset_of($s, px)  (O(n+m) merge)
-
-SELECT feat_id
-FROM feature_coverage
-WHERE set_subset_of($s::INTEGER[], px)    -- S ⊆ px
-  AND NOT set_subset_of(px, $s::INTEGER[]) -- px ⊄ S (strict superset)
-```
-
-### Exact coverage queries
-
-```sql
--- Features that cover exactly S
 SELECT feat_id FROM feature_coverage
-WHERE set_equal(px, $s::INTEGER[]);
+WHERE set_subset_of($s::INTEGER[], px);  -- S ⊆ px, O(n+m) per row
 ```
 
-### BFS intersection: carry coverage through recursive CTEs
+Compared to `WHERE list_has_all(px, $s)` which is O(n×m).
 
-Unlike unsorted list operations, `set_intersect` returns a value that can be passed through recursive CTEs and used as a deduplication key — the same intermediate intersection reached via different paths has the same sorted representation and thus the same dedup key.
+### Intersection size in HAVING
+
+Avoid materialising the intersection when you only need the count.
+
+```sql
+SELECT feat_id, set_intersect_size(px, $target) AS overlap
+FROM feature_coverage
+WHERE set_intersect_size(px, $target) >= 4
+ORDER BY overlap DESC;
+```
+
+### BFS through recursive CTEs
+
+`set_intersect` produces a value that can be carried through recursive CTEs. The same intermediate intersection reached via different paths has the same sorted representation, enabling deduplication.
 
 ```sql
 WITH RECURSIVE
@@ -266,86 +206,64 @@ seed AS (
 ),
 bfs(feat_ids, coverage, depth) AS (
     SELECT [feat_id], px, 1 FROM seed
-
     UNION ALL
-
     SELECT bfs.feat_ids || [seed.feat_id],
            set_intersect(bfs.coverage, seed.px),
            bfs.depth + 1
-    FROM bfs
-    JOIN seed ON seed.feat_id > bfs.feat_ids[-1]
+    FROM bfs JOIN seed ON seed.feat_id > bfs.feat_ids[-1]
     WHERE bfs.depth < 5
       AND set_size(bfs.coverage) > set_size($s)
       AND set_subset_of($s, seed.px)
 )
-SELECT feat_ids, depth
-FROM bfs
-WHERE set_equal(coverage, $s)
+SELECT feat_ids, depth FROM bfs
+WHERE set_equal(coverage, $s);
 ```
 
-### Overlap count in HAVING clause
+### Residual computation
+
+Compute which output pixels remain uncovered after promoting some rows to macros.
 
 ```sql
--- Features with at least 4 pixels in common with target
--- set_intersect_size avoids allocating the result array
-SELECT feat_id, set_intersect_size(px, $target) AS overlap
-FROM feature_coverage
-WHERE set_intersect_size(px, $target) >= 4
-ORDER BY overlap DESC;
+SELECT set_subtract(
+    (SELECT sorted_set(list(col_id)) FROM _dlx_target),
+    (SELECT set_union_agg(covered_cols) FROM _dlx_rows WHERE row_type = 'macro')
+) AS residual;
 ```
 
-### OR search: union of subsets
+### Universe for predicate search
+
+Build the union of all instance pixel sets as the search universe.
 
 ```sql
-WITH
-target AS (SELECT $s::INTEGER[] AS s),
-subsets AS (
-    SELECT feat_id, px FROM feature_coverage, target
-    WHERE set_subset_of(px, target.s)
-      AND set_size(px) > 0
-)
--- Find pair whose union equals target
-SELECT a.feat_id, b.feat_id
-FROM subsets a
-JOIN subsets b ON b.feat_id > a.feat_id, target
-WHERE set_equal(set_union(a.px, b.px), target.s)
+SELECT set_union_agg(instance_pixels) AS universe
+FROM _ts_instances
+WHERE slot_id = $slot_id;
 ```
 
-### Working with global pixel IDs
+### Common core of a group
 
-For multi-example systems where pixel IDs are encoded as `example_id * NB + local_id`:
+Find pixels present in every instance of a slot.
 
 ```sql
--- Build global-ID coverage for a predicate across all examples
-SELECT feat_id, sorted_set(list(example_id * 256 + pixel_id)) AS px
-FROM pixels
-WHERE c = 2
-GROUP BY feat_id;
-
--- S ⊆ coverage across all examples simultaneously:
--- No per-example loop needed — the global ID encoding handles it
-WHERE set_subset_of($s_global, px)
+SELECT slot_id, set_intersect_agg(instance_pixels) AS invariant_core
+FROM _ts_instances
+GROUP BY slot_id;
 ```
 
 ---
 
-## Performance notes
+## Performance
 
-**All merge operations are O(n+m)** where n and m are the sizes of the input sets. This is optimal — you must read every element of both inputs at least once.
+| Operation | This extension | DuckDB built-in |
+|---|---|---|
+| Intersection | O(n+m) merge | O(n×m) hash |
+| Union | O(n+m) merge | O(n×m) hash |
+| Subset check | O(n+m) merge walk | O(n×m) nested loop |
+| Intersection size | O(n+m), no allocation | O(n×m) + allocate |
+| Min / Max | O(1) | O(n) scan |
+| Sort+dedup | O(n log n) once at write | O(n log n) per query |
 
-**Compared to DuckDB built-ins:**
-- `list_intersect` — O(n×m) with hash table overhead. `set_intersect` — O(n+m).
-- `list_has_all` — O(n×m) nested loop. `set_subset_of` — O(n+m) merge walk.
-- `list_sort` + `list_distinct` at query time — O(n log n) per operation. `sorted_set()` once at insert — O(n log n) at write, free at read.
-
-**`set_intersect_size` vs `set_intersect`:** When you only need the count (e.g. `HAVING set_intersect_size(px, target) = 5`), `set_intersect_size` saves the allocation and list-building overhead of materialising the full result. Prefer it in filter predicates.
-
-**The sorted invariant is not enforced at read time.** If you insert data directly without using `sorted_set()`, operations will produce incorrect results silently. Use `set_is_valid()` in an assertion or CHECK constraint if you need guarantees:
-
-```sql
-ALTER TABLE feature_coverage
-ADD CONSTRAINT px_is_sorted CHECK (set_is_valid(px));
-```
+The O(n+m) bound is optimal — you must read every element of both inputs. Practical speedup is 10–50× for typical ARC-scale set sizes (50–500 elements).
 
 ---
 
@@ -353,8 +271,6 @@ ADD CONSTRAINT px_is_sorted CHECK (set_is_valid(px));
 
 ```bash
 make test
-# or
-./build/release/test/unittest --test-dir test [sql]
 ```
 
 ## License
