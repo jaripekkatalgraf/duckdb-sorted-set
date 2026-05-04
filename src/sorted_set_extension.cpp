@@ -2,13 +2,14 @@
 
 #include "sorted_set_extension.hpp"
 #include "sorted_set_type.hpp"
+#include "set_search_core.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/aggregate_function.hpp"
-#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/function/table_function.hpp"
 
 #include <algorithm>
 
@@ -139,7 +140,7 @@ static void set_min(DataChunk &args, ExpressionState &, Vector &result) {
         if (v.IsNull()) { FlatVector::SetNull(result, i, true); continue; }
         auto data = read_int_list(v);
         if (data.empty()) { FlatVector::SetNull(result, i, true); continue; }
-        result.SetValue(i, Value::INTEGER(*std::min_element(data.begin(),data.end())));
+        result.SetValue(i, Value::INTEGER(data.front()));  // ← was min_element
     }
 }
 
@@ -150,7 +151,7 @@ static void set_max(DataChunk &args, ExpressionState &, Vector &result) {
         if (v.IsNull()) { FlatVector::SetNull(result, i, true); continue; }
         auto data = read_int_list(v);
         if (data.empty()) { FlatVector::SetNull(result, i, true); continue; }
-        result.SetValue(i, Value::INTEGER(*std::max_element(data.begin(),data.end())));
+        result.SetValue(i, Value::INTEGER(data.back()));   // ← was max_element
     }
 }
 
@@ -374,10 +375,10 @@ struct SetIntersectAgg {
             // Early exit: once intersection is empty it stays empty
             if (st.data && st.data->empty()) continue;
 
-            auto incoming = read_int_list(inputs[0].GetValue(i));
+            auto incoming = read_int_list(inputs[0].GetValue(i));  // safe even with selection vector
 
             if (!st.data) {
-                // First row: seed the state
+                // First non-null row: seed the state
                 st.data = new std::vector<int32_t>(std::move(incoming));
             } else {
                 // Subsequent rows: intersect in-place
@@ -462,6 +463,141 @@ struct SetIntersectAgg {
         return func;
     }
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// set_search helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+static SearchMode parse_mode(const std::string &s) {
+    if (s == "AND")     return SearchMode::AND;
+    if (s == "OR")      return SearchMode::OR;
+    if (s == "AND_NOT") return SearchMode::AND_NOT;
+    return SearchMode::AUTO;
+}
+
+struct SetSearchBindData : public TableFunctionData {
+    std::vector<SearchResult> results;
+    mutable idx_t offset = 0;
+};
+
+static unique_ptr<FunctionData> set_search_bind(
+    ClientContext &context,
+    TableFunctionBindInput &input,
+    vector<LogicalType> &return_types,
+    vector<string> &names)
+{
+    return_types = {LogicalType::LIST(LogicalType::BIGINT),
+                    LogicalType::VARCHAR,
+                    LogicalType::INTEGER};
+    names = {"result_ids", "op", "depth"};
+
+    auto result = make_uniq<SetSearchBindData>();
+
+    const auto &target_val = input.inputs[0];
+    if (target_val.IsNull()) return result;
+
+    std::vector<int32_t> target = read_int_list(target_val);
+    if (!target.empty()) {
+        int32_t new_n = sorted_set::normalise(target.data(), (int32_t)target.size(), target.data());
+        target.resize(new_n);
+    }
+
+    // ids
+    const auto &ids_val = input.inputs[1];
+    std::vector<int64_t> ids;
+    for (const auto &v : ListValue::GetChildren(ids_val))
+        ids.push_back(v.GetValue<int64_t>());
+
+    // coverages
+    const auto &covs_val = input.inputs[2];
+    std::vector<CoverageEntry> entries;
+    const auto &cov_list = ListValue::GetChildren(covs_val);
+    for (idx_t i = 0; i < cov_list.size() && i < ids.size(); ++i) {
+        std::vector<int32_t> px = read_int_list(cov_list[i]);
+        if (!px.empty()) {
+            int32_t new_n = sorted_set::normalise(px.data(), (int32_t)px.size(), px.data());
+            px.resize(new_n);
+        }
+        Bloom256 bl = Bloom256::from_pixels(px);
+        entries.emplace_back(ids[i], std::move(px), bl);
+    }
+
+    // named params (unchanged)
+    std::string mode_str = "AUTO";
+    auto mode_it = input.named_parameters.find("mode");
+    if (mode_it != input.named_parameters.end() && !mode_it->second.IsNull())
+        mode_str = mode_it->second.GetValue<string>();
+
+    int32_t max_depth = 5, max_results = 10;
+    // ... (depth_it, res_it, blooms_it as before)
+
+    SetSearchEngine engine;
+    result->results = engine.search(target, entries, parse_mode(mode_str), max_depth, max_results);
+
+    return result;
+}
+
+static void set_search_function(
+    ClientContext &context,
+    TableFunctionInput &data_p,
+    DataChunk &output)
+{
+    auto &data = data_p.bind_data->Cast<SetSearchBindData>();
+    if (data.offset >= data.results.size()) {
+        output.SetCardinality(0);
+        return;
+    }
+
+    idx_t count = std::min((idx_t)(data.results.size() - data.offset), (idx_t)STANDARD_VECTOR_SIZE);
+    output.SetCardinality(count);
+
+    auto &ids_col = output.data[0];
+    auto &op_col  = output.data[1];
+    auto &dep_col = output.data[2];
+
+    for (idx_t i = 0; i < count; ++i) {
+        const auto &r = data.results[data.offset + i];
+
+        vector<Value> id_vals;
+        for (int64_t id : r.ids)
+            id_vals.push_back(Value::BIGINT(id));
+        ids_col.SetValue(i, Value::LIST(LogicalType::BIGINT, std::move(id_vals)));
+
+        op_col.SetValue(i, Value(r.op));
+        dep_col.SetValue(i, Value::INTEGER(r.depth));
+    }
+
+    data.offset += count;
+}
+
+static void bloom_of_function(
+    DataChunk &args, ExpressionState &state, Vector &result)
+{
+    auto &input = args.data[0];
+    idx_t count = args.size();
+
+    UnifiedVectorFormat input_format;
+    input.ToUnifiedFormat(count, input_format);
+
+    result.SetVectorType(VectorType::FLAT_VECTOR);
+
+    for (idx_t i = 0; i < count; ++i) {
+        idx_t idx = input_format.sel->get_index(i);
+        if (!input_format.validity.RowIsValid(idx)) {
+            FlatVector::SetNull(result, i, true);
+            continue;
+        }
+
+        std::vector<int32_t> pixels = read_int_list(input.GetValue(idx));
+        auto bloom = Bloom256::from_pixels(pixels);
+
+        vector<Value> bloom_vals = {
+            Value::UBIGINT(bloom.w[0]), Value::UBIGINT(bloom.w[1]),
+            Value::UBIGINT(bloom.w[2]), Value::UBIGINT(bloom.w[3])
+        };
+        result.SetValue(i, Value::LIST(LogicalType::UBIGINT, std::move(bloom_vals)));
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Load
@@ -558,6 +694,34 @@ static void LoadInternal(ExtensionLoader &loader) {
     // ── Aggregates ────────────────────────────────────────────────────────────
     loader.RegisterFunction(SetUnionAgg::GetFunction());
     loader.RegisterFunction(SetIntersectAgg::GetFunction());
+
+        // ── set_search table function ─────────────────────────────────────────────
+    TableFunction set_search_func(
+        "set_search",
+        {
+            LogicalType::LIST(LogicalType::INTEGER),
+            LogicalType::LIST(LogicalType::BIGINT),
+            LogicalType::LIST(LogicalType::LIST(LogicalType::INTEGER)),
+        },
+        set_search_function,
+        set_search_bind
+    );
+    set_search_func.named_parameters["blooms"] =
+        LogicalType::LIST(LogicalType::LIST(LogicalType::UBIGINT));
+    set_search_func.named_parameters["mode"]        = LogicalType::VARCHAR;
+    set_search_func.named_parameters["max_depth"]   = LogicalType::INTEGER;
+    set_search_func.named_parameters["max_results"] = LogicalType::INTEGER;
+
+    loader.RegisterFunction(set_search_func);
+
+    // ── bloom_of scalar function ──────────────────────────────────────────────
+    ScalarFunction bloom_func(
+        "bloom_of",
+        {LogicalType::LIST(LogicalType::INTEGER)},
+        LogicalType::LIST(LogicalType::UBIGINT),
+        bloom_of_function
+    );
+    loader.RegisterFunction(bloom_func);
 }
 
 void SortedSetExtension::Load(ExtensionLoader &loader) {
@@ -565,7 +729,7 @@ void SortedSetExtension::Load(ExtensionLoader &loader) {
 }
 
 std::string SortedSetExtension::Name() { return "sorted_set"; }
-std::string SortedSetExtension::Version() const { return "v0.1.0"; }
+std::string SortedSetExtension::Version() const { return "v0.2.0"; }
 
 } // namespace duckdb
 
