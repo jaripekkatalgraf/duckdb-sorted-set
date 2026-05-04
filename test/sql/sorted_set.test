@@ -1,0 +1,399 @@
+# sorted_set extension tests
+
+require sorted_set
+
+# ── Construction ──────────────────────────────────────────────────────────────
+
+query I
+SELECT sorted_set([3, 1, 2, 1, 3]::INTEGER[])
+----
+[1, 2, 3]
+
+query I
+SELECT sorted_set([1, 2, 3]::INTEGER[])
+----
+[1, 2, 3]
+
+query I
+SELECT sorted_set([]::INTEGER[])
+----
+[]
+
+# Single element
+query I
+SELECT sorted_set([42]::INTEGER[])
+----
+[42]
+
+# Negative values
+query I
+SELECT sorted_set([3, -1, 0, -2]::INTEGER[])
+----
+[-2, -1, 0, 3]
+
+# set_from_range: inclusive range [lo, hi]
+query I
+SELECT set_from_range(1, 5)
+----
+[1, 2, 3, 4, 5]
+
+query I
+SELECT set_from_range(0, 0)
+----
+[0]
+
+query I
+SELECT set_from_range(5, 3)
+----
+[]
+
+
+# ── Validation ────────────────────────────────────────────────────────────────
+
+query I
+SELECT set_is_valid([1, 2, 3]::INTEGER[])
+----
+true
+
+query I
+SELECT set_is_valid([3, 1, 2]::INTEGER[])
+----
+false
+
+query I
+SELECT set_is_valid([1, 1, 2]::INTEGER[])
+----
+false
+
+query I
+SELECT set_is_valid([]::INTEGER[])
+----
+true
+
+
+# ── Predicates ────────────────────────────────────────────────────────────────
+
+# set_contains
+query I
+SELECT set_contains([1, 3, 5, 7]::INTEGER[], 3)
+----
+true
+
+query I
+SELECT set_contains([1, 3, 5, 7]::INTEGER[], 4)
+----
+false
+
+query I
+SELECT set_contains([]::INTEGER[], 1)
+----
+false
+
+# set_equal
+query I
+SELECT set_equal([1, 2, 3]::INTEGER[], [1, 2, 3]::INTEGER[])
+----
+true
+
+query I
+SELECT set_equal([1, 2, 3]::INTEGER[], [1, 2, 4]::INTEGER[])
+----
+false
+
+query I
+SELECT set_equal([1, 2]::INTEGER[], [1, 2, 3]::INTEGER[])
+----
+false
+
+query I
+SELECT set_equal([]::INTEGER[], []::INTEGER[])
+----
+true
+
+# set_subset_of
+query I
+SELECT set_subset_of([1, 2]::INTEGER[], [1, 2, 3]::INTEGER[])
+----
+true
+
+query I
+SELECT set_subset_of([1, 2, 3]::INTEGER[], [1, 2, 3]::INTEGER[])
+----
+true
+
+query I
+SELECT set_subset_of([1, 4]::INTEGER[], [1, 2, 3]::INTEGER[])
+----
+false
+
+query I
+SELECT set_subset_of([]::INTEGER[], [1, 2, 3]::INTEGER[])
+----
+true
+
+# set_superset_of
+query I
+SELECT set_superset_of([1, 2, 3]::INTEGER[], [1, 2]::INTEGER[])
+----
+true
+
+query I
+SELECT set_superset_of([1, 2]::INTEGER[], [1, 2, 3]::INTEGER[])
+----
+false
+
+# set_disjoint
+query I
+SELECT set_disjoint([1, 2]::INTEGER[], [3, 4]::INTEGER[])
+----
+true
+
+query I
+SELECT set_disjoint([1, 2, 3]::INTEGER[], [3, 4, 5]::INTEGER[])
+----
+false
+
+query I
+SELECT set_disjoint([]::INTEGER[], [1, 2, 3]::INTEGER[])
+----
+true
+
+
+# ── Set operations ────────────────────────────────────────────────────────────
+
+# set_intersect
+query I
+SELECT set_intersect([1, 2, 3, 4]::INTEGER[], [2, 4, 6]::INTEGER[])
+----
+[2, 4]
+
+query I
+SELECT set_intersect([1, 2]::INTEGER[], [3, 4]::INTEGER[])
+----
+[]
+
+query I
+SELECT set_intersect([1, 2, 3]::INTEGER[], [1, 2, 3]::INTEGER[])
+----
+[1, 2, 3]
+
+query I
+SELECT set_intersect([]::INTEGER[], [1, 2]::INTEGER[])
+----
+[]
+
+# set_union
+query I
+SELECT set_union([1, 3, 5]::INTEGER[], [2, 4, 6]::INTEGER[])
+----
+[1, 2, 3, 4, 5, 6]
+
+query I
+SELECT set_union([1, 2, 3]::INTEGER[], [2, 3, 4]::INTEGER[])
+----
+[1, 2, 3, 4]
+
+query I
+SELECT set_union([]::INTEGER[], [1, 2]::INTEGER[])
+----
+[1, 2]
+
+# set_subtract
+query I
+SELECT set_subtract([1, 2, 3, 4]::INTEGER[], [2, 4]::INTEGER[])
+----
+[1, 3]
+
+query I
+SELECT set_subtract([1, 2, 3]::INTEGER[], [4, 5]::INTEGER[])
+----
+[1, 2, 3]
+
+query I
+SELECT set_subtract([1, 2, 3]::INTEGER[], [1, 2, 3]::INTEGER[])
+----
+[]
+
+query I
+SELECT set_subtract([]::INTEGER[], [1, 2]::INTEGER[])
+----
+[]
+
+# set_symmetric_diff
+query I
+SELECT set_symmetric_diff([1, 2, 3]::INTEGER[], [2, 3, 4]::INTEGER[])
+----
+[1, 4]
+
+query I
+SELECT set_symmetric_diff([1, 2]::INTEGER[], [3, 4]::INTEGER[])
+----
+[1, 2, 3, 4]
+
+query I
+SELECT set_symmetric_diff([1, 2, 3]::INTEGER[], [1, 2, 3]::INTEGER[])
+----
+[]
+
+
+# ── Scalar accessors ──────────────────────────────────────────────────────────
+
+# set_size
+query I
+SELECT set_size([1, 2, 3, 4, 5]::INTEGER[])
+----
+5
+
+query I
+SELECT set_size([]::INTEGER[])
+----
+0
+
+# set_min / set_max — O(1) since sorted
+query I
+SELECT set_min([3, 7, 1, 9]::INTEGER[])
+----
+1
+
+query I
+SELECT set_max([3, 7, 1, 9]::INTEGER[])
+----
+9
+
+# set_intersect_size — without materialising the intersection
+query I
+SELECT set_intersect_size([1, 2, 3, 4]::INTEGER[], [2, 4, 6]::INTEGER[])
+----
+2
+
+query I
+SELECT set_intersect_size([1, 2]::INTEGER[], [3, 4]::INTEGER[])
+----
+0
+
+# set_rank — 0-based position in sorted set
+query I
+SELECT set_rank([10, 20, 30, 40]::INTEGER[], 20)
+----
+1
+
+query I
+SELECT set_rank([10, 20, 30, 40]::INTEGER[], 25)
+----
+-1
+
+# set_at — element at 0-based rank
+query I
+SELECT set_at([10, 20, 30, 40]::INTEGER[], 2)
+----
+30
+
+query I
+SELECT set_at([10, 20, 30, 40]::INTEGER[], 99)
+----
+NULL
+
+
+# ── Mutation ──────────────────────────────────────────────────────────────────
+
+# set_add — inserts in sorted position, no-op if present
+query I
+SELECT set_add([1, 3, 5]::INTEGER[], 4)
+----
+[1, 3, 4, 5]
+
+query I
+SELECT set_add([1, 3, 5]::INTEGER[], 3)
+----
+[1, 3, 5]
+
+query I
+SELECT set_add([]::INTEGER[], 7)
+----
+[7]
+
+# set_remove — removes element, no-op if absent
+query I
+SELECT set_remove([1, 2, 3, 4]::INTEGER[], 3)
+----
+[1, 2, 4]
+
+query I
+SELECT set_remove([1, 2, 3]::INTEGER[], 99)
+----
+[1, 2, 3]
+
+
+# ── Composability with standard SQL ──────────────────────────────────────────
+
+# Works inside CTEs
+query I
+WITH
+a AS (SELECT sorted_set([5,3,1,3]::INTEGER[]) AS s),
+b AS (SELECT sorted_set([2,4,3]::INTEGER[])   AS s)
+SELECT set_union(a.s, b.s) FROM a, b
+----
+[1, 2, 3, 4, 5]
+
+# Works in WHERE clause
+query I
+SELECT count(*) FROM (
+    SELECT * FROM (VALUES
+        ([1,2,3]::INTEGER[]),
+        ([1,4,5]::INTEGER[]),
+        ([2,3,6]::INTEGER[])
+    ) t(px)
+    WHERE set_contains(px, 3)
+)
+----
+2
+
+# set_intersect_size in HAVING — common pattern for superset queries
+statement ok
+CREATE TEMP TABLE coverage (feat_id INTEGER, px INTEGER[]);
+
+statement ok
+INSERT INTO coverage VALUES
+    (1, [0,1,2,3,4,5]),
+    (2, [0,1,2,9,10]),
+    (3, [3,4,5,6,7]),
+    (4, [0,1,2,3,4,5,6]);
+
+# Which features are supersets of [0,1,2,3]?
+query I rowsort
+SELECT feat_id FROM coverage
+WHERE set_subset_of([0,1,2,3]::INTEGER[], px)
+----
+1
+4
+
+# Which feature exactly covers [0,1,2,3,4,5]?
+query I
+SELECT feat_id FROM coverage
+WHERE set_equal(px, [0,1,2,3,4,5]::INTEGER[])
+----
+1
+
+# Intersection size for HAVING clause usage
+query II rowsort
+SELECT feat_id, set_intersect_size(px, [0,1,2]::INTEGER[]) AS overlap
+FROM coverage
+WHERE set_intersect_size(px, [0,1,2]::INTEGER[]) >= 2
+----
+1	3
+2	3
+4	3
+
+# BFS-style: carry intersection through a join
+query I
+WITH
+target AS (SELECT [0,1,2,3,4,5]::INTEGER[] AS s),
+step1  AS (
+    SELECT c.feat_id, set_intersect(c.px, t.s) AS inter
+    FROM coverage c, target t
+    WHERE set_subset_of(t.s, c.px)
+)
+SELECT feat_id FROM step1 WHERE set_equal(inter, (SELECT s FROM target))
+----
+1
+4
